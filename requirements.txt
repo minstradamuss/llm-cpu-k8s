@@ -1,0 +1,5 @@
+# vLLM is provided by the official versioned CPU-only base image.
+# The complete freeze (including transitive dependencies) is generated at
+# Docker build time as /opt/app/requirements.txt. See README for exporting
+# the actual full lock from your built image before publishing the repository.
+vllm==0.32.0
