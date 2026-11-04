@@ -1,6 +1,8 @@
 .git
-.env
-__pycache__
-*.pyc
-*.zip
 .venv
+__pycache__
+**/__pycache__
+**/secrets.env
+benchmark
+tests
+*.zip

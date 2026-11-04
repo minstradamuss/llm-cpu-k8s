@@ -1,31 +1,33 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: llm-cpu
+  name: llm
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: llm-cpu
+      app: llm
   template:
     metadata:
       labels:
-        app: llm-cpu
+        app: llm
     spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
       securityContext:
+        runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
         fsGroup: 10001
-        runAsNonRoot: true
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       initContainers:
         - name: download-model
-          image: llm-cpu:0.1
+          image: student-model-init:1.0
           imagePullPolicy: IfNotPresent
-          command: ["python", "/opt/app/scripts/download_model.py"]
           envFrom:
             - configMapRef:
                 name: llm-config
@@ -39,17 +41,23 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
-              drop: ["ALL"]
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
           volumeMounts:
-            - name: model-cache
+            - name: models
               mountPath: /models
-            - name: tmp
+            - name: download-tmp
               mountPath: /tmp
       containers:
         - name: vllm
-          image: llm-cpu:0.1
+          image: student-vllm-cpu:1.0
           imagePullPolicy: IfNotPresent
-          command: ["python", "/opt/app/scripts/serve.py"]
           ports:
             - name: http
               containerPort: 8000
@@ -57,52 +65,62 @@ spec:
             - configMapRef:
                 name: llm-config
           env:
-            - name: API_TOKEN
+            - name: VLLM_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: llm-secrets
-                  key: API_TOKEN
-            - name: HF_HUB_OFFLINE
-              value: "1"
-            - name: TRANSFORMERS_OFFLINE
-              value: "1"
-          resources:
-            requests:
-              cpu: "2"
-              memory: 5Gi
-            limits:
-              cpu: "4"
-              memory: 10Gi
+                  key: API_KEY
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
-              drop: ["ALL"]
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: "4"
+              memory: 6Gi
+            limits:
+              cpu: "4"
+              memory: 7Gi
           startupProbe:
             httpGet:
               path: /health
-              port: 8000
+              port: http
             periodSeconds: 10
             failureThreshold: 90
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /health
-              port: 8000
+              port: http
             periodSeconds: 10
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /health
-              port: 8000
+              port: http
             periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
           volumeMounts:
-            - name: model-cache
+            - name: models
               mountPath: /models
               readOnly: true
-            - name: tmp
+            - name: runtime-tmp
               mountPath: /tmp
+            - name: shm
+              mountPath: /dev/shm
       volumes:
-        - name: model-cache
+        - name: models
           persistentVolumeClaim:
-            claimName: llm-model-cache
-        - name: tmp
-          emptyDir: {}
+            claimName: model-cache
+        - name: download-tmp
+          emptyDir:
+            sizeLimit: 512Mi
+        - name: runtime-tmp
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi

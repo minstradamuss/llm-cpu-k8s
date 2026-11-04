@@ -1,106 +1,139 @@
-# CPU-only vLLM в Minikube
+# vLLM на CPU в Minikube
 
-Тестовое задание для команды исследования технологий машинного обучения.
+Лоскутова М.Р. — Команда исследования технологий машинного обучения.
 
-## Что используется
-
-- vLLM 0.32.0 в официальном CPU-образе `vllm/vllm-openai-cpu:v0.32.0-x86_64`.
-- Модель `Qwen/Qwen2.5-0.5B-Instruct` на CPU, `float32`, контекст 1024 токена.
-- Kubernetes ConfigMap, Secret, PVC, Deployment и Service.
-- Контейнер под UID 10001, без root, без GPU, с ограниченными правами.
-
-Для запуска нужны Docker, Minikube, kubectl и примерно 4 CPU / 12 ГиБ RAM. Сборка рассчитана на x86_64. На некоторых CPU инструкции AVX могут ограничивать совместимость официального образа.
+OpenAI-совместимый API для Qwen2.5-0.5B-Instruct. Используется vLLM 0.32.0+cpu, без GPU и без квантизации, с float32. Модель закреплена на commit `7ae557604adf67be50417f59c2c2f167def9a775`.
 
 ## Запуск
 
-```bash
-minikube start --cpus=4 --memory=12288 --disk-size=25g
-minikube image build -t llm-cpu:0.1 .
-```
+Нужны Docker с Linux-контейнерами, Minikube, kubectl и Python 3.10+. Для Docker нужно выделить хотя бы 6 CPU и 10 ГБ RAM; Minikube использует 6 CPU и 8 ГБ RAM. На диске желательно иметь 30 ГБ свободного места. Образ рассчитан на Linux x86-64 с AVX2. На Windows используется Docker Desktop с WSL2.
 
-Создайте ресурс Secret с реальным ключом. Не коммитьте ключ в git. Один из способов — создать локальный файл `.env` (он добавлен в `.gitignore`):
+Из корня проекта:
 
 ```text
-HF_TOKEN=
-API_TOKEN=YOUR_RANDOM_LONG_TOKEN
+python scripts/deploy.py
+kubectl --context vllm-cpu -n llm-cpu port-forward service/llm 8000:8000
 ```
 
-Для публичной модели HF_TOKEN может быть пустым. Для gated-моделей нужен настоящий токен HF.
+Первый скрипт создаёт локальный секрет, запускает кластер, собирает два образа, загружает их в Minikube и применяет Kustomize. Первое скачивание образа vLLM и весов может занять время. Команду port-forward нужно оставить работающей. API доступен на `http://127.0.0.1:8000`.
 
-```bash
-kubectl create secret generic llm-secrets --from-env-file=.env
-kubectl apply -k k8s/
-kubectl get pods -w
+В другом терминале:
+
+```text
+python scripts/smoke.py
+python scripts/benchmark.py
 ```
 
-Первый запуск скачивает модель в PVC. При рестарте initContainer читает файл `.ready.json` и не обращается к Hugging Face. Основной контейнер работает с `HF_HUB_OFFLINE=1` и читает volume без права записи.
+Скрипты читают ключ из `k8s/overlays/local/secrets.env` или переменной окружения `API_KEY`. Файл с ключами исключён из Git и Docker build context. Его не нужно добавлять в репозиторий.
 
-```bash
-kubectl logs deployment/llm-cpu -c download-model
-kubectl logs deployment/llm-cpu -c vllm
-kubectl port-forward service/llm-cpu 8000:8000
+Для публичной Qwen токен HF не требуется. Для gated-модели перед первым запуском нужно установить `HF_TOKEN` в окружении, изменить `MODEL_ID` и `MODEL_REVISION` в `k8s/base/config.env`, а также получить доступ к модели на Hugging Face. Токен передаётся только initContainer. Если `secrets.env` уже создан, значения нужно изменить в нём.
+
+Пример запроса в PowerShell:
+
+```powershell
+$key = (Get-Content k8s/overlays/local/secrets.env | Where-Object { $_.StartsWith('API_KEY=') }).Substring(8)
+$body = @{model='qwen'; messages=@(@{role='user'; content='Explain what a database index is.'}); max_tokens=32} | ConvertTo-Json -Depth 5
+Invoke-RestMethod http://127.0.0.1:8000/v1/chat/completions -Method Post -Headers @{Authorization="Bearer $key"} -ContentType 'application/json' -Body $body
 ```
 
-В другом терминале выполните запрос (Linux/macOS/PowerShell с curl.exe):
+## Файлы и конфигурация
 
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_RANDOM_LONG_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"qwen-cpu","messages":[{"role":"user","content":"Привет!"}],"max_tokens":32}'
+| Файл | Назначение |
+|---|---|
+| `Dockerfile` | Собственный образ сервера на фиксированной CPU-базе vLLM |
+| `Dockerfile.init` | Лёгкий Python-образ загрузчика без сторонних библиотек |
+| `requirements.txt` | Все 172 Python-пакета серверного образа с точными версиями |
+| `requirements-init.txt` | Зафиксированное Python-окружение загрузчика |
+| `src/download_model.py` | Скачивание, проверка и повторное использование весов |
+| `src/start.py` | Формирование команды vLLM из ConfigMap |
+| `src/privacy.py`, `src/logging.json` | Аудит запросов, фильтрация логов и авторизация |
+| `k8s/base` | Deployment, Service, PVC, Namespace и ConfigMap |
+| `k8s/overlays/local` | Kustomize overlay и генератор Secret |
+| `scripts/benchmark.py` | Нагрузочный тест streaming API |
+| `benchmark/results.json` | Исходные результаты каждого запроса |
+
+Оба базовых образа закреплены по SHA256 digest. Python-пакеты уже находятся в фиксированном базовом образе; сборка проверяет их через `pip --no-index --no-deps` и полное сравнение с requirements. Обновлений зависимостей во время сборки нет. Это позволяет не компилировать vLLM и PyTorch на ноутбуке.
+
+Оба контейнера запускаются как UID/GID 10001. В Kubernetes отключены повышение привилегий и automount service account token, сброшены capabilities, включены RuntimeDefault seccomp и read-only root filesystem. PVC монтируется в сервер только для чтения. Запись разрешена в отдельных временных томах. GPU-ресурсы и CUDA отсутствуют.
+
+Параметры меняются в `k8s/base/config.env`. После изменения:
+
+```text
+kubectl --context vllm-cpu apply -k k8s/overlays/local
+kubectl --context vllm-cpu -n llm-cpu rollout status deployment/llm --timeout=900s
 ```
 
-Запрос без токена должен вернуть HTTP 401.
+Kustomize меняет имя ConfigMap при изменении содержимого, поэтому Deployment автоматически пересоздаёт под. Стратегия Recreate подходит для одной реплики с ReadWriteOnce PVC. Для другого Kubernetes-кластера нужно загрузить образы в свой registry, заменить их имена в overlay и выбрать доступный StorageClass.
 
-## Конфигурация и безопасность
+## Кэш и секреты
 
-Параметры модели и запуска лежат в `k8s/configmap.yaml`. После изменения ConfigMap примените манифесты и перезапустите Deployment:
+InitContainer сохраняет модель в `/models/qwen/<commit>`. При первом запуске он получает список файлов HF, проверяет commit, скачивает файлы и сверяет размер и SHA256 для LFS-весов либо Git blob hash для остальных файлов. Поддерживаются повторные попытки и HTTP Range для докачки. Файл `.ready.json` создаётся атомарно только после проверки всех файлов.
 
-```bash
-kubectl apply -k k8s/
-kubectl rollout restart deployment/llm-cpu
+При следующем запуске проверяются локальные размеры и SHA256 из `.ready.json`. Если всё совпадает, выводится `model_cache_hit`, обращений к HF нет. Незавершённая или повреждённая загрузка восстанавливается. `flock` защищает от одновременной записи нескольких загрузчиков.
+
+Основной контейнер использует локальный путь, `HF_HUB_OFFLINE=1` и `TRANSFORMERS_OFFLINE=1`. Из Secret он получает только API-ключ. HF-токен получает только загрузчик; при перенаправлении на другой домен Authorization удаляется. Сам Secret создаётся через `secretGenerator`, реальные значения в Git отсутствуют. Kubernetes Secret требует доверенного доступа к кластеру; base64 не является шифрованием.
+
+## Приватность логов
+
+Логирование промптов и результатов в vLLM отключено явными флагами. SafeFormatter не сериализует текст сообщения, аргументы форматирования или текст исключения. Для ошибок остаются имя логгера, уровень, строка исходного кода и класс исключения.
+
+Родительский процесс пропускает в stdout только структурированные записи с внутренним случайным маркером, который удаляется перед выводом. Необработанные traceback и прямой вывод библиотек подавляются, поэтому обход logging через stderr также не раскрывает данные. При завершении сохраняются exit code и число подавленных строк. SIGTERM передаётся всей группе процессов vLLM.
+
+ASGI middleware записывает `request_complete`: случайный request ID, известный маршрут, метод, HTTP-статус и полное время обработки. Время для streaming включает отправку последнего чанка. Тело запроса, ответ модели, query string, заголовки и токены в аудит не попадают. Стандартный access log Uvicorn отключён.
+
+Bearer-токен проверяется и для маршрутов вне `/v1`; ненужные маршруты закрыты. Без токена оставлены только `/health` и `/metrics`. Сервис имеет тип ClusterIP и используется через localhost port-forward. Для публичного размещения потребуется TLS на ingress.
+
+## Проверки
+
+```text
+docker run --rm --entrypoint python -v "${PWD}:/project:ro" student-model-init:1.0 -m unittest discover -s /project/tests -v
+python scripts/smoke.py
+kubectl --context vllm-cpu -n llm-cpu rollout restart deployment/llm
+kubectl --context vllm-cpu -n llm-cpu rollout status deployment/llm --timeout=900s
+kubectl --context vllm-cpu -n llm-cpu logs deployment/llm -c download-model
 ```
 
-`SafeRequestsMiddleware` в `scripts/safe_requests.py` проверяет `Authorization: Bearer ...` для всех HTTP endpoints, кроме `/health` и `/ping`. Это важно, потому что встроенный `--api-key` vLLM покрывает не все маршруты. Также он регистрирует факт запроса: метод, тип маршрута, HTTP-код и задержку. Тексты промптов, ответы и сами токены в журнал не попадают.
+Unit-тесты проверяют отсутствие содержимого в логах, авторизацию, работу streaming, офлайн-кэш, восстановление повреждённого файла, отсутствие маркера после ошибки и удаление HF-токена при редиректе. Smoke-тест обращается к настоящему API, проверяет 401 без токена, ответ модели, ошибочный запрос, отсутствие промпта/ответа/ключа в логах и UID 10001.
 
-У vLLM отключены логи запросов, ответов и Uvicorn access log. Дополнительно файл `logging.json` устанавливает уровни для внутренних логгеров. Класс middleware также не выводит строку запроса или заголовки.
+После рестарта ожидается `model_cache_hit`. PVC сохраняется при пересоздании пода. Удаление namespace или кластера может удалить и модель.
 
-Рекомендуется использовать этот сервис только через `kubectl port-forward` или внутри закрытого кластера. Для публичного доступа потребуется TLS, сетевые политики, rate limiting и регулярная ротация токенов. `/health` оставлен открытым для Kubernetes probes.
+## Нагрузочный тест
 
-## Зависимости
-
-Используется официальный CPU-образ строго заданной версии vLLM. Список Python-пакетов и **всех транзитивных зависимостей** фиксируется командой `pip freeze --all` в `/opt/app/requirements.txt` при сборке собственного Docker-образа. В репозитории `requirements.txt` сначала содержит только прямую версию vLLM. Перед окончательной отправкой в GitHub нужно сохранить полный lock из собранного образа:
-
-```bash
-kubectl exec deployment/llm-cpu -c vllm -- cat /opt/app/requirements.txt > requirements.txt
+```text
+python scripts/benchmark.py --requests 12 --warmup 2 --concurrency 1 4 --output-tokens 32
 ```
 
-Эта команда выполняется после запуска пода. После экспорта `requirements.txt` с транзитивными пакетами закоммитьте его вместе с остальными файлами. Эта операция необходима для полного выполнения требования о pinned dependencies. Для строгой повторяемости сборки также можно закрепить исходный Docker-образ по digest.
+Тест запускает четыре сценария: короткий и длинный промпты при параллельности 1 и 4. На каждый сценарий приходится 12 измеряемых запросов и 2 запроса прогрева. `temperature=0`, `ignore_eos=true`, длина генерации 32 токена. Prefix caching отключён, chunked prefill включён. Это небольшой локальный тест, а не длительный стресс-тест.
 
-## Нагрузочный тест (дополнительно)
+TTFT измеряется от отправки HTTP-запроса до первого непустого текстового delta, без учёта начального чанка с role. Latency — время до `[DONE]`. Throughput — сумма выходных токенов успешных запросов, делённая на время всего сценария; отдельно указаны запросы в секунду. Число токенов берётся из `usage`, а не из количества SSE-чанков. Прогрев не входит в метрики. Ошибки сохраняются в JSON и приводят к ненулевому exit code.
 
-После запуска сервиса:
+Измерения выполнены 04.11.2026 на Intel Core i9-13900H, 16 ГБ RAM, Windows/WSL2. Кластер: Minikube 1.39.0, Kubernetes 1.37.0, 6 CPU и 8 ГБ RAM. Контейнер vLLM: лимит 4 CPU / 7 ГБ RAM, 4 OpenMP-потока, KV-кэш 256 МиБ. Настройки и версии сохранены в `benchmark/environment.json`.
 
-```bash
-export API_TOKEN=YOUR_RANDOM_LONG_TOKEN
-python scripts/benchmark.py --samples 3
+| Промпт | Параллельность | Успех/всего | Вход, ток. | TTFT p50/p95, мс | Latency p50/p95, мс | Запр./с | Выходных ток./с |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| short | 1 | 12/12 | 40.2 | 200.3 / 212.5 | 2625.7 / 2832.2 | 0.377 | 12.06 |
+| short | 4 | 12/12 | 40.2 | 642.4 / 652.8 | 3341.8 / 3355.5 | 1.198 | 38.35 |
+| long | 1 | 12/12 | 1131.2 | 3997.9 / 4087.1 | 6473.2 / 6572.4 | 0.155 | 4.95 |
+| long | 4 | 12/12 | 1131.2 | 7098.6 / 13839.5 | 18418.0 / 25683.5 | 0.215 | 6.87 |
+
+Все 48 измеряемых запросов завершились успешно, каждый с 32 выходными токенами. На коротких промптах параллельность 4 увеличила throughput примерно в 3,18 раза при росте медианной latency с 2,63 до 3,34 с. На длинных выигрыш составил около 1,39 раза, а медианная latency выросла с 6,47 до 18,42 с. Здесь высокая параллельность хуже подходит для интерактивного ответа: CPU дольше обрабатывает большие входы. На 12 запросах p95 даёт только предварительную оценку хвостовой задержки.
+
+До измерений в тестовый PVC была скопирована уже существовавшая локальная модель, проверенная по SHA256 Hugging Face. InitContainer подтвердил `model_cache_hit`. Скачивание и запуск сервера не входят в измерения. Отдельно проверен запуск загрузчика с `--network none` на заполненном кэше. Результаты относятся к этому ноутбуку и передаче через `kubectl port-forward`; для другой машины тест надо повторить.
+
+## Как повысить throughput
+
+При большом потоке коротких запросов я бы сначала увеличила `MAX_NUM_SEQS` с 4 до 8, затем до 16, и сравнила output tokens/s с p95 задержки. Это даёт планировщику больше возможностей объединять запросы в batch. `MAX_NUM_BATCHED_TOKENS` можно проверить на 512 и 1024. При повторяющемся общем префиксе полезно включить prefix caching, но эффект нужно измерять отдельно. Слишком большая параллельность на четырёх CPU может увеличить очередь и ухудшить p95.
+
+Для небольшого числа длинных запросов я бы оставила chunked prefill и уменьшила `MAX_NUM_SEQS` до 1–2, чтобы ограничить конкуренцию за CPU и KV-кэш. Затем сравнила бы `MAX_NUM_BATCHED_TOKENS` 512, 1024 и 2048: более крупные порции prefill могут повысить throughput, но увеличивают время ожидания уже декодируемых запросов. `MAX_MODEL_LEN` надо увеличить до требуемого контекста, а `KV_CACHE_MEMORY_BYTES` — только при достаточной RAM и с соответствующим memory limit. На этой машине исходный лимит контекста 2048, поэтому он не предназначен для очень больших контекстов без изменения конфигурации.
+
+В обоих случаях количество OpenMP-потоков и affinity должны соответствовать реально выделенным CPU. На большем сервере можно выделить отдельные ядра API и inference или добавить реплики. Уменьшение точности стоит рассматривать только после проверки поддержки CPU и качества модели. Перечисленные изменения — направления следующих экспериментов, а не измеренные ускорения.
+
+Документация: [vLLM CPU](https://docs.vllm.ai/en/v0.32.0/getting_started/installation/cpu/), [настройка batching и памяти](https://docs.vllm.ai/en/v0.32.0/configuration/optimization/), [ограничения встроенной авторизации](https://docs.vllm.ai/en/v0.32.0/usage/security/).
+
+## Остановка
+
+```text
+minikube stop -p vllm-cpu
 ```
 
-Скрипт отдельно проверяет короткий и длинный промпты и печатает таблицу медианных TTFT, E2E latency и throughput (токенов/с). Для потокового ответа время первого содержательного токена определяется по SSE, а число токенов — из `usage.completion_tokens`.
-
-| Промпт | TTFT, с | Latency, с | Throughput, токен/с |
-|---|---:|---:|---:|
-| Короткий | — | — | — |
-| Длинный | — | — | — |
-
-Результаты не заполнены, поскольку запуск в Minikube на реальном CPU не проводился.
-
-Для большого количества коротких запросов можно экспериментировать с `max_num_seqs`, пакетированием и количеством потоков CPU. Для небольшого количества запросов с длинным контекстом стоит проверять `max_model_len`, доступный размер KV cache и `max_num_batched_tokens`. Каждое изменение нужно оценивать на одинаковой нагрузке по TTFT, задержке и пропускной способности.
-
-## Проверка кода без Kubernetes
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-Документация: https://docs.vllm.ai/en/v0.32.0/getting_started/installation/cpu/ ; https://docs.vllm.ai/en/v0.32.0/cli/serve/ ; https://docs.vllm.ai/en/v0.32.0/examples/features/logging_configuration/
+Повторный запуск: `minikube start -p vllm-cpu`. Для удаления тестового кластера и его данных: `minikube delete -p vllm-cpu`.
